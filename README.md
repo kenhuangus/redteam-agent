@@ -88,6 +88,33 @@ omitted. The mock target disables throttling.
 Two config-only settings have no CLI flags: `max_tokens` (default 512, sent on every
 probe as a completion ceiling) and `exploit_confirmation` (the step-6 re-probe).
 
+### CI gate
+
+`--fail-on` turns findings into an exit code, so the harness can gate a pipeline:
+
+```bash
+# exit 3 as soon as a high-or-worse finding is reported; exit 0 otherwise
+python -m redteam_agent run --config engagement.json --fail-on high --quiet
+```
+
+Exit codes: `0` clean, `2` scope or setup error, `3` gate hit. `--fail-on` accepts
+`none` (default), `low`, `medium`, `high`, `critical`.
+
+`--sarif` writes SARIF 2.1.0 (default `redteam.sarif`), one rule per attack and one
+result per confirmed finding, with OWASP framework/category, severity, confidence,
+reproduction status, and remediation in `properties`. Raw transcripts are deliberately
+**excluded**: they can contain the very secrets or PII the run captured, and CI logs
+are a poor place to publish those.
+
+```yaml
+# .github/workflows/redteam.yml
+- run: python -m redteam_agent run --config engagement.json --sarif redteam.sarif --fail-on high
+- uses: github/codeql-action/upload-sarif@v3
+  if: always()
+  with:
+    sarif_file: redteam.sarif
+```
+
 ## Judging
 
 Rules lead. `RuleJudge` checks the attack's `Expect` criteria (leak keywords,
@@ -123,6 +150,7 @@ matching `.md`. Both contain:
 - engagement record: approver, reference, target, model, kind
 - run record: probes, turns, errors, elapsed, stop reason, budget, seed
 - severity counts and a coverage matrix per category, with the mutations that worked
+- optional SARIF 2.1.0 for code-scanning consumers (no transcripts in it)
 - findings sorted by severity, each with evidence, indicators, reproduction status
   (`yes`, `no`, `not attempted`, and which technique reproduced it), remediation,
   and a reproduction command

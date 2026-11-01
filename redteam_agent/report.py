@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from dataclasses import dataclass
@@ -278,3 +279,142 @@ def write_reports(
     json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     md_path.write_text(render_markdown(payload), encoding="utf-8")
     return ReportBundle(json_path=json_path, md_path=md_path, payload=payload)
+
+
+# ----------------------------------------------------------------------------
+# SARIF 2.1.0 output, for GitHub code scanning and other CI consumers.
+# ----------------------------------------------------------------------------
+
+SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
+SARIF_LEVELS = {
+    "critical": "error",
+    "high": "error",
+    "medium": "warning",
+    "low": "warning",
+    "info": "note",
+}
+
+
+def _fingerprint(finding: Any) -> str:
+    """Stable per-finding identifier: no transcript, so leaked data does not travel."""
+    basis = f"{finding.attack_id}|{finding.category}|{finding.mutation}|{finding.title}"
+    return hashlib.sha256(basis.encode()).hexdigest()[:32]
+
+
+def build_sarif(*, config: Any, result: Any) -> dict[str, Any]:
+    """Render a SARIF log of the confirmed findings.
+
+    Raw transcripts are deliberately omitted: they can contain the secrets or PII
+    the run itself found, and CI logs are a poor place to publish them. Reasoning
+    and indicators carry enough context to triage.
+    """
+    findings = sorted(result.findings, key=lambda f: f.severity_rank, reverse=True)
+    rules: dict[str, dict[str, Any]] = {}
+    for finding in findings:
+        rules.setdefault(
+            finding.attack_id,
+            {
+                "id": finding.attack_id,
+                "name": finding.title,
+                "shortDescription": {"text": finding.title},
+                "fullDescription": {"text": finding.goal},
+                "defaultConfiguration": {
+                    "level": SARIF_LEVELS.get(finding.severity, "note")
+                },
+                "properties": {
+                    "framework": finding.framework,
+                    "category": finding.category,
+                    "control": finding.control_label,
+                    "tags": [finding.framework, finding.category],
+                },
+            },
+        )
+
+    results = []
+    for finding in findings:
+        indicators = ", ".join(finding.indicators) or "none"
+        message = (
+            f"{finding.attack_id} ({finding.control_label}): {finding.reasoning} "
+            f"Indicators: {indicators}."
+        )
+        remediation = REMEDIATION.get(finding.category, [])
+        markdown = message
+        if remediation:
+            markdown += "\n\nRemediation:\n" + "\n".join(f"- {item}" for item in remediation)
+        results.append(
+            {
+                "ruleId": finding.attack_id,
+                "level": SARIF_LEVELS.get(finding.severity, "note"),
+                "message": {"text": message, "markdown": markdown},
+                "partialFingerprints": {
+                    "redteamFinding/v1": _fingerprint(finding)
+                },
+                "properties": {
+                    "severity": finding.severity,
+                    "confidence": finding.confidence,
+                    "framework": finding.framework,
+                    "category": finding.category,
+                    "control": finding.control_label,
+                    "mutation": finding.mutation,
+                    "indicators": finding.indicators,
+                    "needs_manual_review": finding.needs_manual_review,
+                    "confirmed": finding.confirmed,
+                    "confirm_with": finding.confirm_with,
+                    "remediation": remediation,
+                },
+            }
+        )
+
+    return {
+        "$schema": SARIF_SCHEMA,
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "redteam-agent",
+                        "version": _version(),
+                        "rules": list(rules.values()),
+                    }
+                },
+                "invocations": [
+                    {
+                        "executionSuccessful": True,
+                        "startTimeUtc": _iso(result.started_at),
+                        "endTimeUtc": _iso(result.ended_at),
+                    }
+                ],
+                "results": results,
+                "properties": {
+                    "engagement": {
+                        "target": result.target_name,
+                        "model": result.model,
+                        "kind": config.target.kind,
+                        "authorized_by": config.scope.authorized_by,
+                        "authorization_ref": config.scope.authorization_ref,
+                    },
+                    "probes": result.probes,
+                    "stopped_reason": result.stopped_reason,
+                },
+            }
+        ],
+    }
+
+
+def _version() -> str:
+    from . import __version__
+
+    return __version__
+
+
+def _iso(timestamp: float) -> str:
+    if not timestamp:
+        return ""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp))
+
+
+def write_sarif(path: str | Path, payload: dict[str, Any]) -> Path:
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return out

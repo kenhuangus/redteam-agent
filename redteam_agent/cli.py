@@ -20,8 +20,9 @@ from urllib.parse import urlsplit
 from .agent import RedTeamAgent
 from .attacks import ATTACKS
 from .config import AuthorizationError, JudgeConfig, RunConfig, Scope, TargetConfig
+from .taxonomy import SEVERITY_RANK
 from .judges import build_judge
-from .report import write_reports
+from .report import build_sarif, write_reports, write_sarif
 from .targets import build_target
 
 
@@ -65,6 +66,19 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--verbose", "-v", action="store_true")
     run.add_argument("--quiet", "-q", action="store_true")
     run.add_argument("--json", action="store_true", help="print JSON to stdout")
+    run.add_argument(
+        "--fail-on",
+        choices=["none", "low", "medium", "high", "critical"],
+        default="none",
+        help="exit 3 when a finding reaches this severity (for CI gates)",
+    )
+    run.add_argument(
+        "--sarif",
+        nargs="?",
+        const="redteam.sarif",
+        default=None,
+        help="also write SARIF 2.1.0 (default path: redteam.sarif)",
+    )
 
     # ------------------------------------------------------------ validate
     val = sub.add_parser("validate", help="check scope without probing")
@@ -177,12 +191,28 @@ def cmd_run(args: argparse.Namespace) -> int:
     result = agent.run()
     bundle = write_reports(config=config, result=result, agent=agent)
 
+    if args.sarif:
+        sarif_path = write_sarif(args.sarif, build_sarif(config=config, result=result))
+        if not args.quiet:
+            print(f"SARIF: {sarif_path}", file=sys.stderr)
+
     if args.json:
         print(json.dumps(bundle.payload, indent=2, ensure_ascii=False))
     elif not args.quiet:
         print(bundle.md_path.read_text(encoding="utf-8"))
     else:
         print(bundle.md_path)
+
+    gate = args.fail_on
+    if gate != "none":
+        threshold = SEVERITY_RANK[gate]
+        worst = max((f.severity_rank for f in result.findings), default=-1)
+        if worst >= threshold:
+            print(
+                f"gate: a {gate}-or-worse finding was reported (exit 3)",
+                file=sys.stderr,
+            )
+            return 3
     return 0
 
 

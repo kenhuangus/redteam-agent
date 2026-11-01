@@ -1,0 +1,19 @@
+{
+  "scope": {
+    "target_name": "mock",
+    "max_probes": 260,
+    "max_turns": 260
+  },
+  "target": {
+    "kind": "mock",
+    "system_prompt": ""
+  },
+  "judges": {
+    "canary": "CANARY-RT-7f3a91c4",
+    "use_llm_judge": false
+  },
+  "output_dir": "reports",
+  "seed": 1337,
+  "payloads_per_attack": 3,
+  "mutations_per_payload": 5
+}

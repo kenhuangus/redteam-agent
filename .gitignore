@@ -1,0 +1,20 @@
+# generated run artifacts
+reports/
+tmp/
+*.json.bak
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+build/
+dist/
+
+# editor / os noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

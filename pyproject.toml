@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redteam-agent"
+version = "0.1.0"
+description = "Authorized AI and agent red-teaming harness with OWASP mapping"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+redteam-agent = "redteam_agent.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["redteam_agent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

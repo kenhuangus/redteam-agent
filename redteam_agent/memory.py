@@ -32,6 +32,13 @@ class Finding:
     confirmed: bool | None = None
     confirm_with: str = ""
     agentic_class: str = "A0"
+    # ARTEX-style provenance: which evidence row produced this finding, and what
+    # the dedicated retester concluded (reproduced / not_reproduced / inconclusive).
+    probe_seq: int = 0
+    evidence_digest: str = ""
+    evidence_path: str = ""
+    reproduction_verdict: str = ""
+    quality: dict[str, Any] = field(default_factory=dict)
 
     @property
     def control_label(self) -> str:

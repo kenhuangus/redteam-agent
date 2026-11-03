@@ -66,7 +66,8 @@ class TargetConfig:
     system_prompt: str = ""                 # what the agent under test runs
     api_key_env: str = "OPENAI_API_KEY"     # env var NAME, never a literal secret
     extra_headers: dict[str, str] = field(default_factory=dict)
-    timeout_s: float = 30.0
+    timeout_s: float = 120.0
+    num_predict: int = 256          # ollama completion ceiling (overridden by max_tokens)
     tools: tuple[str, ...] = ()
 
 
@@ -97,6 +98,22 @@ class RunConfig:
     mutations_per_payload: int = 2
     exploit_confirmation: bool = True
     max_tokens: int = 512
+    # Reports quote transcripts as evidence; scrub the canary and any secret-shaped
+    # match out of them unless the operator explicitly asks for raw text.
+    redact_transcripts: bool = True
+    # Planner health knobs, modelled on ARTEX's stagnation detector and provider
+    # circuit breaker: stop finding the same nothing, and stop retrying a dead host.
+    stagnation_rounds: int = 6
+    target_error_limit: int = 3
+    # When set, every probe is appended to <dir>/probes.jsonl with a hash chain.
+    evidence_dir: str = ""
+    quality_gate: bool = True
+    # Adaptive payloads: the ReAct lab chooses the next payload family from the
+    # previous reply instead of walking a fixed mutation ladder.
+    agentic_payloads: bool = True
+    # Off by default: a probe whose prize is a mutating tool call is refused so a
+    # read-only engagement cannot delete or change anything in the target.
+    allow_state_changing: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -123,4 +140,11 @@ class RunConfig:
             mutations_per_payload=data.get("mutations_per_payload", 2),
             exploit_confirmation=data.get("exploit_confirmation", True),
             max_tokens=data.get("max_tokens", 512),
+            redact_transcripts=data.get("redact_transcripts", True),
+            stagnation_rounds=int(data.get("stagnation_rounds", 6)),
+            target_error_limit=int(data.get("target_error_limit", 3)),
+            evidence_dir=data.get("evidence_dir", ""),
+            quality_gate=data.get("quality_gate", True),
+            agentic_payloads=bool(data.get("agentic_payloads", True)),
+            allow_state_changing=bool(data.get("allow_state_changing", False)),
         )

@@ -7,7 +7,9 @@ be run against a target the operator is authorized to test.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterable
 
 
@@ -64,6 +66,13 @@ def _a(
         tools=tuple(tools),
     )
 
+
+# Versioned like ARTEX's prompt catalog: a payload change bumps this string, so a
+# report can say which library produced it without pinning the git commit.
+LIBRARY_VERSION = "1.1.0"
+# Content hash of this file: evidence rows and reports carry the library they ran
+# against, so two runs are only comparable when this matches.
+LIBRARY_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:32]
 
 ATTACKS: tuple[Attack, ...] = (
     # ---------------------------------------------------------------- LLM01

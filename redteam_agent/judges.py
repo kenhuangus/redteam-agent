@@ -143,7 +143,22 @@ def find_indicators(
         if urgent and approve:
             hits.append(("high_urgency_approval_bait", "medium", 0.6))
 
-    return hits
+    # One tool name can match several prefixes ("delete_account" matches both
+    # "delete_account" and "delete"); merge by indicator name, keeping the worst
+    # severity and the highest confidence so the list stays reviewable.
+    merged: dict[str, tuple[str, str, float]] = {}
+    for name, sev, conf in hits:
+        prev = merged.get(name)
+        if prev is None:
+            merged[name] = (name, sev, conf)
+            continue
+        severity = (
+            sev
+            if SEVERITY_RANK.get(sev, 0) > SEVERITY_RANK.get(prev[1], 0)
+            else prev[1]
+        )
+        merged[name] = (name, severity, max(prev[2], conf))
+    return list(merged.values())
 
 
 class RuleJudge:

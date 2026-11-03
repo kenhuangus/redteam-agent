@@ -30,6 +30,9 @@ class ProbeResult:
     error: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
     model: str = ""
+    # Provider-reported token accounting; a benchmark needs cost, not guesses.
+    usage: dict[str, Any] = field(default_factory=dict)
+    attempts: int = 1
 
     @property
     def ok(self) -> bool:
@@ -52,6 +55,50 @@ class Target(Protocol):
         canary: str | None = None,
         max_tokens: int | None = None,
     ) -> ProbeResult: ...
+
+
+# A redirect can only be followed by re-sending the same request, which would
+# hand the bearer token to the redirect target. Refuse 3xx instead.
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Turn every 3xx into an HTTPError so the Authorization header is never forwarded."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+_RETRYABLE_STATUS = (429, 500, 502, 503, 504)
+
+
+def _canary_system_prompt(system_prompt: str, canary: str | None) -> str:
+    """Embed the audit canary where a leak would surface it.
+
+    Live targets previously received the canary argument and ignored it, which
+    disabled canary detection outside the mock. The marker is appended to the
+    system message so a prompt leak carries it out, and stated as non-secret so a
+    well-behaved target is not asked to hide anything.
+    """
+    if not canary:
+        return system_prompt
+    marker = (
+        "Compliance audit marker (public identifier, no action required): "
+        f"{canary}"
+    )
+    return f"{system_prompt}\n\n{marker}" if system_prompt else marker
+
+
+def _usage_of(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Normalize provider usage to prompt/completion/total tokens."""
+    raw = parsed.get("usage") or {}
+    prompt = raw.get("prompt_tokens", raw.get("input_tokens"))
+    completion = raw.get("completion_tokens", raw.get("output_tokens"))
+    total = raw.get("total_tokens")
+    if isinstance(prompt, int) and isinstance(completion, int):
+        total = total if isinstance(total, int) else prompt + completion
+    return {
+        "prompt_tokens": prompt if isinstance(prompt, int) else None,
+        "completion_tokens": completion if isinstance(completion, int) else None,
+        "total_tokens": total if isinstance(total, int) else None,
+    }
 
 
 def _coerce_tool_calls(choice: dict[str, Any]) -> list[dict[str, Any]]:
@@ -237,7 +284,6 @@ class HttpTarget:
     """
 
     def __init__(self, config: Any) -> None:
-        self.name = config.target_name if hasattr(config, "target_name") else "http"
         self.endpoint = config.endpoint
         self.model = config.model
         self.system_prompt = config.system_prompt
@@ -245,6 +291,24 @@ class HttpTarget:
         self.extra_headers: dict[str, str] = dict(config.extra_headers)
         self.timeout_s = config.timeout_s
         self.name = self.endpoint
+        self.max_attempts = 3
+        self.max_retry_delay_s = 5.0
+        self.retry_on_status = _RETRYABLE_STATUS
+        self._opener = urllib.request.build_opener(_NoRedirect)
+
+    def _open(self, request: urllib.request.Request) -> Any:
+        """Indirection so tests can substitute a transport without a network."""
+        return self._opener.open(request, timeout=self.timeout_s)
+
+    def _retry_delay(self, exc: urllib.error.HTTPError, attempt: int) -> float:
+        header = exc.headers.get("Retry-After") if exc.headers else None
+        try:
+            server_delay = float(header) if header is not None else None
+        except (TypeError, ValueError):
+            server_delay = None
+        if server_delay is None or server_delay <= 0:
+            server_delay = 0.5 * (2 ** (attempt - 1))
+        return min(server_delay, self.max_retry_delay_s)
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -266,24 +330,46 @@ class HttpTarget:
         }
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
-        if self.system_prompt:
-            payload["messages"].insert(
-                0, {"role": "system", "content": self.system_prompt}
-            )
+        system = _canary_system_prompt(self.system_prompt, canary)
+        if system:
+            payload["messages"].insert(0, {"role": "system", "content": system})
         data = json.dumps(payload).encode()
-        req = urllib.request.Request(
-            self.endpoint, data=data, headers=self._headers(), method="POST"
-        )
         start = time.perf_counter()
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
-        except (urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
-            return ProbeResult(
-                error=f"{type(exc).__name__}: {exc}",
-                latency_ms=(time.perf_counter() - start) * 1000,
-                model=self.model,
+        body = ""
+        attempt = 0
+        while True:
+            attempt += 1
+            req = urllib.request.Request(
+                self.endpoint, data=data, headers=self._headers(), method="POST"
             )
+            try:
+                with self._open(req) as resp:
+                    body = resp.read().decode("utf-8", errors="replace")
+                break
+            except urllib.error.HTTPError as exc:
+                if 300 <= exc.code < 400:
+                    return ProbeResult(
+                        error=(
+                            f"redirect not followed: HTTP {exc.code} to "
+                            f"{getattr(exc, 'url', '') or 'an unverified host'}"
+                        ),
+                        latency_ms=(time.perf_counter() - start) * 1000,
+                        model=self.model,
+                    )
+                if exc.code in self.retry_on_status and attempt < self.max_attempts:
+                    time.sleep(self._retry_delay(exc, attempt))
+                    continue
+                return ProbeResult(
+                    error=f"HTTP {exc.code}: {exc.reason}",
+                    latency_ms=(time.perf_counter() - start) * 1000,
+                    model=self.model,
+                )
+            except (urllib.error.URLError, OSError) as exc:
+                return ProbeResult(
+                    error=f"{type(exc).__name__}: {exc}",
+                    latency_ms=(time.perf_counter() - start) * 1000,
+                    model=self.model,
+                )
         latency = (time.perf_counter() - start) * 1000
         try:
             parsed = json.loads(body)
@@ -292,6 +378,7 @@ class HttpTarget:
 
         text = ""
         tool_calls: list[dict[str, Any]] = []
+        usage: dict[str, Any] = {}
         if isinstance(parsed, dict):
             choices = parsed.get("choices")
             if isinstance(choices, list) and choices:
@@ -301,12 +388,111 @@ class HttpTarget:
             elif "output" in parsed:
                 text = str(parsed["output"])
                 tool_calls = parsed.get("tool_calls") or []
+            usage = _usage_of(parsed)
         return ProbeResult(
             text=text,
             tool_calls=tool_calls,
             latency_ms=latency,
             raw=parsed if isinstance(parsed, dict) else {},
             model=self.model,
+            usage=usage,
+            attempts=attempt,
+        )
+
+
+# ----------------------------------------------------------------------------
+# Ollama target: native /api/chat, no API key, local model.
+# ----------------------------------------------------------------------------
+
+
+class OllamaTarget:
+    """POST ``/api/chat`` on an Ollama server; returns message content and usage.
+
+    Ollama is the common local deployment for a model that actually performs the
+    role under test (a support agent with tools), so the benchmark can produce
+    real numbers without sending customer data to a third-party API.
+    """
+
+    def __init__(self, config: Any) -> None:
+        self.endpoint = config.endpoint or "http://127.0.0.1:11434/api/chat"
+        self.model = config.model
+        self.system_prompt = config.system_prompt
+        self.num_predict = config.num_predict
+        self.timeout_s = config.timeout_s
+        self.name = self.endpoint
+        self._opener = urllib.request.build_opener(_NoRedirect)
+
+    def _open(self, request: urllib.request.Request) -> Any:
+        return self._opener.open(request, timeout=self.timeout_s)
+
+    def probe(
+        self,
+        messages: list[Message],
+        canary: str | None = None,
+        max_tokens: int | None = None,
+    ) -> ProbeResult:
+        wire = [{"role": m.role, "content": m.content} for m in messages]
+        system = _canary_system_prompt(self.system_prompt, canary)
+        if system:
+            wire.insert(0, {"role": "system", "content": system})
+        limit = max_tokens if max_tokens is not None else self.num_predict
+        payload = {
+            "model": self.model,
+            "messages": wire,
+            "stream": False,
+            "options": {"num_predict": limit},
+        }
+        body = json.dumps(payload).encode()
+        start = time.perf_counter()
+        attempt = 0
+        parsed: dict[str, Any] = {}
+        while True:
+            attempt += 1
+            try:
+                req = urllib.request.Request(
+                    self.endpoint,
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self._open(req) as resp:
+                    parsed = json.loads(resp.read().decode("utf-8", "replace"))
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code in _RETRYABLE_STATUS and attempt < 3:
+                    time.sleep(0.5 * (2 ** (attempt - 1)))
+                    continue
+                return ProbeResult(
+                    error=f"HTTP {exc.code}: {exc.reason}",
+                    latency_ms=(time.perf_counter() - start) * 1000,
+                    model=self.model,
+                    attempts=attempt,
+                )
+            except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+                return ProbeResult(
+                    error=f"{type(exc).__name__}: {exc}",
+                    latency_ms=(time.perf_counter() - start) * 1000,
+                    model=self.model,
+                    attempts=attempt,
+                )
+        latency = (time.perf_counter() - start) * 1000
+        usage = {
+            "prompt_tokens": parsed.get("prompt_eval_count"),
+            "completion_tokens": parsed.get("eval_count"),
+            "total_tokens": (
+                (parsed.get("prompt_eval_count") or 0) + (parsed.get("eval_count") or 0)
+            ),
+        }
+        message = parsed.get("message") or {}
+        tool_calls = message.get("tool_calls") or []
+        return ProbeResult(
+            text=str(message.get("content") or ""),
+            tool_calls=tool_calls,
+            latency_ms=latency,
+            raw=parsed,
+            model=parsed.get("model") or self.model,
+            usage=usage,
+            attempts=attempt,
         )
 
 
@@ -339,8 +525,9 @@ class OpenAITarget:
 
         client = OpenAI(api_key=os.environ.get(self.api_key_env, ""))
         wire = [{"role": m.role, "content": m.content} for m in messages]
-        if self.system_prompt:
-            wire.insert(0, {"role": "system", "content": self.system_prompt})
+        system = _canary_system_prompt(self.system_prompt, canary)
+        if system:
+            wire.insert(0, {"role": "system", "content": system})
         start = time.perf_counter()
         kwargs: dict[str, Any] = {"model": self.model, "messages": wire}
         if max_tokens is not None:
@@ -359,11 +546,17 @@ class OpenAITarget:
             {"name": tc.function.name, "arguments": tc.function.arguments}
             for tc in (msg.tool_calls or [])
         ]
+        usage = {
+            "prompt_tokens": getattr(resp.usage, "prompt_tokens", None),
+            "completion_tokens": getattr(resp.usage, "completion_tokens", None),
+            "total_tokens": getattr(resp.usage, "total_tokens", None),
+        }
         return ProbeResult(
             text=msg.content or "",
             tool_calls=tool_calls,
             latency_ms=latency,
             model=self.model,
+            usage=usage,
         )
 
 
@@ -378,4 +571,7 @@ def build_target(config: Any) -> Target:
         return HttpTarget(config)
     if kind == "openai":
         return OpenAITarget(config)
-    raise ValueError(f"unknown target kind {kind!r} (use mock|http|openai)")
+    if kind == "ollama":
+        return OllamaTarget(config)
+    raise ValueError(f"unknown target kind {kind!r} (use http|openai|ollama; mock is "
+                     "offline-only and not for benchmarks)")

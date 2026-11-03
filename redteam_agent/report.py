@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .attacks import categories
+from .attacks import ATTACKS, LIBRARY_SHA256, LIBRARY_VERSION, categories
 from .taxonomy import SEVERITY_RANK, label
 
 REMEDIATION: dict[str, list[str]] = {
@@ -82,6 +83,44 @@ def _severity_bar(counts: dict[str, int]) -> str:
     return " | ".join(f"{k}: {counts.get(k, 0)}" for k in order)
 
 
+_REDACT_TOKEN = "[REDACTED]"
+_REDACTED_FIELDS = ("transcript", "payload", "evidence")
+
+
+def _redaction_patterns(config: Any) -> list[str]:
+    """Canary plus every secret shape the run configured, compiled per report.
+
+    A finding's transcript is evidence, but it is also text the target just
+    produced; publishing it verbatim can leak exactly what the engagement
+    captured. The pattern list comes from config, never from the transcript.
+    """
+    judges = getattr(config, "judges", None)
+    patterns: list[str] = []
+    canary = getattr(judges, "canary", "") if judges is not None else ""
+    if canary:
+        patterns.append(re.escape(canary))
+    patterns.extend(getattr(judges, "secret_regexes", ()) if judges is not None else ())
+    return patterns
+
+
+def _scrubbed(finding: dict[str, Any], patterns: list[str]) -> dict[str, Any]:
+    for field_name in _REDACTED_FIELDS:
+        if field_name in finding:
+            finding[field_name] = _redact(finding[field_name], patterns)
+    return finding
+
+
+def _redact(text: Any, patterns: list[str]) -> Any:
+    if not isinstance(text, str) or not text or not patterns:
+        return text
+    for pattern in patterns:
+        try:
+            text = re.sub(pattern, _REDACT_TOKEN, text)
+        except re.error:  # a bad operator-supplied regex must not abort a report
+            continue
+    return text
+
+
 def build_payload(
     *,
     config: Any,
@@ -98,6 +137,8 @@ def build_payload(
         if result.memory
         else agent.coverage()
     )
+    redact = bool(getattr(config, "redact_transcripts", True))
+    patterns = _redaction_patterns(config)
 
     return {
         "schema": "redteam-agent/report/v1",
@@ -122,7 +163,21 @@ def build_payload(
                 "rate_limit_per_min": scope.rate_limit_per_min,
             },
             "seed": config.seed,
+            "stagnation_rounds": getattr(config, "stagnation_rounds", 6),
+            "target_error_limit": getattr(config, "target_error_limit", 3),
         },
+        "library": {
+            "name": "redteam-agent/attack-library",
+            "version": LIBRARY_VERSION,
+            "sha256": LIBRARY_SHA256,
+            "attacks": len(ATTACKS),
+        },
+        "frontier": getattr(result, "frontier", {}),
+        "audit": getattr(result, "audit", {}),
+        "evidence": getattr(result, "evidence", {}),
+        "payload_lab": getattr(result, "payload_lab", {}),
+        "planning_log": getattr(result, "planning_log", []),
+        "read_only_policy": getattr(result, "read_only_policy", {}),
         "summary": {
             "findings_total": len(findings),
             "severity_counts": counts,
@@ -132,11 +187,19 @@ def build_payload(
             "needs_manual_review": sum(1 for f in findings if f.needs_manual_review),
             "confirmed": sum(1 for f in findings if f.confirmed is True),
             "not_reproduced": sum(1 for f in findings if f.confirmed is False),
+            "gated_quarantine": sum(
+                1
+                for f in findings
+                if (getattr(f, "quality", {}) or {}).get("status") == "quarantine"
+            ),
+            "inconclusive_retests": sum(
+                1 for f in findings if getattr(f, "reproduction_verdict", "") == "inconclusive"
+            ),
         },
         "coverage": coverage,
         "findings": [
             {
-                **f.to_dict(),
+                **(_scrubbed(f.to_dict(), patterns) if redact else f.to_dict()),
                 "remediation": REMEDIATION.get(f.category, []),
             }
             for f in findings
@@ -146,7 +209,16 @@ def build_payload(
             "Findings are only valid for the model, version, and system prompt tested.",
             "Coverage counts indicate probes sent, not depth of coverage.",
             "Severity is an impact heuristic; it is not a CVSS or AIVSS score.",
-        ],
+        ]
+        + (
+            []
+            if not redact
+            else [
+                "Transcripts, payloads, and evidence are scrubbed of the canary and "
+                "secret-shaped strings before publication; raw text stays in the run "
+                "log only if the operator opts out."
+            ]
+        ),
     }
 
 
@@ -177,6 +249,44 @@ def render_markdown(payload: dict[str, Any]) -> str:
     out.append(f"Probes sent: **{run['probes']}** | Turns: **{run['turns']}** | "
                f"Errors: **{run['errors']}** | Elapsed: **{run['elapsed_seconds']}s**")
     out.append(f"Stopped: `{run['stopped_reason']}`")
+    library = payload.get("library") or {}
+    if library:
+        out.append(
+            f"Attack library: `{library['name']} {library['version']}` "
+            f"(sha256 `{library['sha256']}`)"
+        )
+    audit = payload.get("audit") or {}
+    if audit:
+        attributions = audit.get("attributions") or {}
+        out.append(
+            f"Probe gate: {audit.get('blocks', 0)} probe(s) blocked; "
+            f"attribution ok={attributions.get('ok', 0)} "
+            f"blocked={attributions.get('blocked', 0)} "
+            f"error={attributions.get('error', 0)}"
+        )
+    policy = payload.get("read_only_policy") or {}
+    if policy:
+        out.append(
+            f"Read-only policy: {policy.get('blocks', 0)} blocked action(s); "
+            f"state-changing probes {'enabled' if policy.get('allow_state_changing') else 'refused'}"
+        )
+    lab = payload.get("payload_lab") or {}
+    if lab:
+        out.append(
+            f"Payload lab: {lab.get('steps', 0)} variant(s); families "
+            f"{', '.join(lab.get('families') or []) or 'none'}"
+        )
+    planning = payload.get("planning_log") or []
+    if planning:
+        uncovered = sum(1 for row in planning if row.get("why") == "uncovered category")
+        out.append(f"Planning: {len(planning)} intent(s), {uncovered} scheduled on uncovered categories")
+    evidence = payload.get("evidence") or {}
+    if evidence:
+        out.append(
+            f"Evidence: `{evidence.get('probes_path')}` "
+            f"({evidence.get('rows', 0)} rows, chain head `{evidence.get('chain_head', '')[:12]}`) "
+            f"| manifest `{evidence.get('manifest_path')}`"
+        )
     out.append("")
 
     out.append("## Coverage matrix")

@@ -44,7 +44,9 @@ def test_http_target_sends_max_tokens(monkeypatch) -> None:
         seen["body"] = req.data
         return _FakeResponse('{"choices": [{"message": {"content": "hi"}}]}')
 
-    monkeypatch.setattr(targets_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        targets_module.HttpTarget, "_open", lambda self, req: fake_urlopen(req)
+    )
     config = TargetConfig(
         kind="http",
         endpoint="https://agent.example.test/v1/chat/completions",
@@ -70,7 +72,9 @@ def test_http_target_omits_max_tokens_when_not_given(monkeypatch) -> None:
         seen["body"] = req.data
         return _FakeResponse('{"output": "ok"}')
 
-    monkeypatch.setattr(targets_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        targets_module.HttpTarget, "_open", lambda self, req: fake_urlopen(req)
+    )
     target = build_target(TargetConfig(kind="http", endpoint="https://x.example.test"))
     assert target.probe([Message(role="user", content="hi")]).text == "ok"
     assert "max_tokens" not in json.loads(seen["body"].decode())
@@ -80,7 +84,7 @@ def test_http_target_reports_transport_error(monkeypatch) -> None:
     def boom(req, timeout=None):  # noqa: ARG001
         raise OSError("connection refused")
 
-    monkeypatch.setattr(targets_module.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(targets_module.HttpTarget, "_open", lambda self, req: boom(req))
     target = build_target(TargetConfig(kind="http", endpoint="https://x.example.test"))
     probe = target.probe([Message(role="user", content="hi")])
     assert not probe.ok
